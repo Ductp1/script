@@ -252,6 +252,8 @@ local PlaybackSystem = {
     upgradeCounts       = {},   -- id -> number of upgrade events issued so far this playback
     pendingPlacements   = {},   -- id -> true while a placement retry loop is still running
     failedPlacements    = {},   -- id -> true once a placement permanently gives up
+    upgradeQueues       = {},   -- id -> array of {path, expectedLevel} waiting to be processed in order
+    upgradeWorkerActive  = {},  -- id -> true while a worker coroutine is draining that tower's queue
 }
 
 local startPlayback, stopPlayback, monitorMatchEndPlay, runPlayback
@@ -288,36 +290,71 @@ local function getActualLevel(troop)
     return nil
 end
 
--- Fires the upgrade call and verifies the tower actually reached
--- expectedLevel via getActualLevel, retrying on mismatch. Runs in
--- its own coroutine so it never blocks runPlayback's main loop --
--- other towers' events keep firing on schedule while this retries.
-local function upgradeTowerWithRetry(id, troop, path, expectedLevel)
-    task.spawn(function()
-        local maxRetries = 5
-        local retryDelay = 0.5
+-- Fires one upgrade call and verifies the tower actually reached
+-- expectedLevel via getActualLevel, retrying on mismatch. This is the
+-- "do one upgrade" primitive -- callers must ensure only one of these
+-- runs at a time per tower (see enqueueUpgrade below), otherwise two
+-- concurrent attempts targeting different expectedLevels fight over
+-- the same troop and neither ever confirms.
+local function attemptUpgrade(id, troop, path, expectedLevel)
+    local maxRetries = 5
+    local retryDelay = 0.5
 
-        for attempt = 1, maxRetries do
-            pcall(function()
-                TroopsChannel:InvokeServer("Upgrade", "Set", { Troop = troop, Path = path })
-            end)
+    for attempt = 1, maxRetries do
+        if not PlaybackSystem.isPlaying then return end
 
-            task.wait(retryDelay)
+        pcall(function()
+            TroopsChannel:InvokeServer("Upgrade", "Set", { Troop = troop, Path = path })
+        end)
 
-            local actualLevel = getActualLevel(troop)
-            if actualLevel == expectedLevel then
-                print("[PLAYBACK] Confirmed upgrade id=" .. id .. " -> level " .. expectedLevel)
-                return
-            end
+        task.wait(retryDelay)
 
-            warn("[PLAYBACK] Upgrade id=" .. id .. " not confirmed (got " ..
-                tostring(actualLevel) .. ", expected " .. expectedLevel ..
-                "), retry " .. attempt .. "/" .. maxRetries)
+        local actualLevel = getActualLevel(troop)
+        if actualLevel == expectedLevel then
+            print("[PLAYBACK] Confirmed upgrade id=" .. id .. " -> level " .. expectedLevel)
+            return
         end
 
-        warn("[PLAYBACK] FAILED to confirm upgrade id=" .. id .. " -> level " ..
-            expectedLevel .. " after " .. maxRetries .. " attempts")
+        warn("[PLAYBACK] Upgrade id=" .. id .. " not confirmed (got " ..
+            tostring(actualLevel) .. ", expected " .. expectedLevel ..
+            "), retry " .. attempt .. "/" .. maxRetries)
+    end
+
+    warn("[PLAYBACK] FAILED to confirm upgrade id=" .. id .. " -> level " ..
+        expectedLevel .. " after " .. maxRetries .. " attempts")
+end
+
+-- Drains PlaybackSystem.upgradeQueues[id] one entry at a time. Only
+-- one worker per tower id is ever running (guarded by
+-- upgradeWorkerActive), so upgrade events for the SAME tower are
+-- strictly serialized -- event N+1's upgrade only starts after event
+-- N's has fully resolved (confirmed or exhausted retries). Different
+-- towers still run fully in parallel since each id gets its own
+-- worker/queue.
+local function runUpgradeWorker(id, troop)
+    if PlaybackSystem.upgradeWorkerActive[id] then
+        return -- a worker for this id is already draining the queue
+    end
+    PlaybackSystem.upgradeWorkerActive[id] = true
+
+    task.spawn(function()
+        local queue = PlaybackSystem.upgradeQueues[id]
+        while queue and #queue > 0 do
+            if not PlaybackSystem.isPlaying then break end
+            local job = table.remove(queue, 1)
+            attemptUpgrade(id, troop, job.path, job.expectedLevel)
+        end
+        PlaybackSystem.upgradeWorkerActive[id] = nil
     end)
+end
+
+-- Adds an upgrade job to this tower's queue and ensures a worker is
+-- running to drain it. Safe to call concurrently for different ids;
+-- for the same id, jobs are processed strictly in the order enqueued.
+local function enqueueUpgrade(id, troop, path, expectedLevel)
+    PlaybackSystem.upgradeQueues[id] = PlaybackSystem.upgradeQueues[id] or {}
+    table.insert(PlaybackSystem.upgradeQueues[id], { path = path, expectedLevel = expectedLevel })
+    runUpgradeWorker(id, troop)
 end
 
 -- ============================================================
@@ -399,12 +436,20 @@ local function executeEvent(event)
     elseif event.type == "UPGRADE_TOWER" then
         local id    = tonumber(data.id) or -1
         local path  = tonumber(data.path) or 1
+
+        -- Increment the counter synchronously, in the same order events
+        -- are read from the recording -- this fixes expectedLevel to the
+        -- correct value before anything async happens. If this were done
+        -- inside the spawned coroutine below, two close-together events
+        -- for the same tower could race and grab counter values out of
+        -- the order they appear in the recording.
+        PlaybackSystem.upgradeCounts[id] = (PlaybackSystem.upgradeCounts[id] or 0) + 1
+        local expectedLevel = PlaybackSystem.upgradeCounts[id]
+
         task.spawn(function()
             local troop = waitForTower(id)
             if troop then
-                PlaybackSystem.upgradeCounts[id] = (PlaybackSystem.upgradeCounts[id] or 0) + 1
-                local expectedLevel = PlaybackSystem.upgradeCounts[id]
-                upgradeTowerWithRetry(id, troop, path, expectedLevel)
+                enqueueUpgrade(id, troop, path, expectedLevel)
             else
                 warn("[PLAYBACK] Cannot upgrade, tower id=" .. id .. " not found")
             end
@@ -528,6 +573,8 @@ startPlayback = function(strategyName, skipFileCheck)
     PlaybackSystem.upgradeCounts      = {}
     PlaybackSystem.pendingPlacements  = {}
     PlaybackSystem.failedPlacements   = {}
+    PlaybackSystem.upgradeQueues      = {}
+    PlaybackSystem.upgradeWorkerActive = {}
     print("[PLAYER] Starting playback: " .. strategyName)
     print("[PLAYER] Triggering auto-skip to start match...")
 
