@@ -254,6 +254,7 @@ local PlaybackSystem = {
     failedPlacements    = {},   -- id -> true once a placement permanently gives up
     upgradeQueues       = {},   -- id -> array of {path, expectedLevel} waiting to be processed in order
     upgradeWorkerActive  = {},  -- id -> true while a worker coroutine is draining that tower's queue
+    runId               = 0,    -- bumped every startPlayback call; lets a stale runPlayback notice it's been superseded
 }
 
 local startPlayback, stopPlayback, monitorMatchEndPlay, runPlayback
@@ -508,14 +509,22 @@ local function executeEvent(event)
 end
 
 runPlayback = function()
-    local events = PlaybackSystem.currentEvents
+    local myRunId = PlaybackSystem.runId
+    local events  = PlaybackSystem.currentEvents
     if not events then return end
     local matchStart = PlaybackSystem.matchStart
     for _, event in ipairs(events) do
         if not PlaybackSystem.isPlaying then return end
+        if PlaybackSystem.runId ~= myRunId then
+            -- a newer startPlayback call has superseded this run; stop
+            -- silently so we never have two runPlayback loops firing
+            -- events over the same/overlapping timeline at once.
+            return
+        end
         local waitTime = event.time - (tick() - matchStart)
         if waitTime > 0 then task.wait(waitTime) end
         if not PlaybackSystem.isPlaying then return end
+        if PlaybackSystem.runId ~= myRunId then return end
         executeEvent(event)
     end
     print("[PLAYBACK] Finished executing all events.")
@@ -559,6 +568,15 @@ monitorMatchEndPlay = function()
 end
 
 startPlayback = function(strategyName, skipFileCheck)
+    -- Reject a fresh external play request while a session is already
+    -- active. The loop-restart path passes skipFileCheck=true and is
+    -- allowed through even though isPlaying is still true at that point
+    -- -- that's an intentional restart, not an accidental double-press.
+    if PlaybackSystem.isPlaying and not skipFileCheck then
+        warn("[PLAYER] startPlayback called while already playing -- ignoring")
+        return false, "Already playing"
+    end
+
     if not skipFileCheck then
         local events, err = loadRecording(strategyName)
         if not events then
@@ -568,6 +586,13 @@ startPlayback = function(strategyName, skipFileCheck)
         PlaybackSystem.currentEvents       = events
         PlaybackSystem.currentStrategyName = strategyName
     end
+
+    -- New generation: any runPlayback coroutine still alive from a
+    -- previous call (shouldn't normally happen now, but this is the
+    -- hard guarantee) will see its captured runId no longer match and
+    -- stop itself instead of continuing to fire events in parallel.
+    PlaybackSystem.runId = PlaybackSystem.runId + 1
+
     PlaybackSystem.isPlaying          = true
     PlaybackSystem.placedTowers       = {}
     PlaybackSystem.upgradeCounts      = {}
