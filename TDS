@@ -304,7 +304,7 @@ end
 -- concurrent attempts targeting different expectedLevels fight over
 -- the same troop and neither ever confirms.
 local function attemptUpgrade(id, troop, path, expectedLevel)
-    local maxRetries = 5
+    local maxRetries = 20
     local retryDelay = 0.5
 
     for attempt = 1, maxRetries do
@@ -377,7 +377,7 @@ local function placeTowerWithRetry(id, towerName, pos)
     PlaybackSystem.pendingPlacements[id] = true
 
     task.spawn(function()
-        local maxRetries = 8
+        local maxRetries = 20
         local retryDelay = 1.0
 
         for attempt = 1, maxRetries do
