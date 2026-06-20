@@ -269,10 +269,14 @@ local syncPlayUI = function() end
 -- ============================================================
 -- Reads the tower model's Upgrades folder to determine its actual
 -- current level: model.Upgrades.<level>.<part/meshpart> with
--- Transparency == 0 at the active level, 1 everywhere else.
+-- Transparency == 0. Visibility is CUMULATIVE -- at level 2, folders
+-- 0, 1, AND 2 are all visible -- so the real level is the HIGHEST
+-- visible folder number, not just the first one found.
 local function getActualLevel(troop)
     local upgrades = troop and troop:FindFirstChild("Upgrades")
     if not upgrades then return nil end
+
+    local highestVisible = nil
 
     for _, levelFolder in ipairs(upgrades:GetChildren()) do
         local levelNum = tonumber(levelFolder.Name)
@@ -280,7 +284,9 @@ local function getActualLevel(troop)
             for _, part in ipairs(levelFolder:GetDescendants()) do
                 if part:IsA("BasePart") then
                     if part.Transparency == 0 then
-                        return levelNum
+                        if not highestVisible or levelNum > highestVisible then
+                            highestVisible = levelNum
+                        end
                     end
                     break -- one sample part per folder is enough
                 end
@@ -288,7 +294,7 @@ local function getActualLevel(troop)
         end
     end
 
-    return nil
+    return highestVisible
 end
 
 -- Fires one upgrade call and verifies the tower actually reached
