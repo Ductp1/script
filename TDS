@@ -1,0 +1,1173 @@
+-- ============================================================
+-- TDS Recorder + Player (Merged)
+-- ============================================================
+
+-- ============================================================
+-- Services
+-- ============================================================
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ============================================================
+-- Utilities
+-- ============================================================
+local function missing(t, f, fallback)
+    if type(f) == t then return f end
+    return fallback
+end
+
+cloneref = missing("function", cloneref, function(x) return x end)
+
+local COREGUI     = cloneref(game:GetService("CoreGui"))
+local localPlayer = Players.LocalPlayer
+
+local function randomString()
+    local length = math.random(10, 20)
+    local array  = {}
+    for i = 1, length do
+        array[i] = string.char(math.random(32, 126))
+    end
+    return table.concat(array)
+end
+
+-- ============================================================
+-- Network Setup
+-- ============================================================
+local Network       = require(ReplicatedStorage.Shared.Modules.Network)
+local TroopsChannel = Network.Channel("Troops")
+
+-- ============================================================
+-- Shared Helpers
+-- ============================================================
+local function isMatchEnded()
+    local playerGui    = localPlayer:WaitForChild("PlayerGui")
+    local rewardsFrame = playerGui:FindFirstChild("ReactGameNewRewards")
+    if rewardsFrame then
+        local frame = rewardsFrame:FindFirstChild("Frame")
+        if frame then
+            local gameOver = frame:FindFirstChild("gameOver")
+            if gameOver then return gameOver.Visible end
+        end
+    end
+    return false
+end
+
+local function autoSkip(tag)
+    pcall(function()
+        local votingRemote = ReplicatedStorage:WaitForChild("RemoteFunction")
+        votingRemote:InvokeServer("Voting", "Skip")
+        print("[" .. tag .. "] Auto-skip triggered!")
+    end)
+end
+
+-- ============================================================
+-- File System Helpers
+-- ============================================================
+local function ensureFolder(path)
+    if not isfolder(path) then
+        makefolder(path)
+        print("[RECORDER] Created folder: " .. path)
+    end
+end
+
+local function fileExists(strategyName)
+    local path = "TDSRecord/strat/" .. strategyName .. ".txt"
+    return isfile(path), path
+end
+
+local function saveRecording(strategyName, content)
+    if not strategyName or strategyName == "" then
+        print("[RECORDER] ERROR: Strategy name is empty!")
+        return false
+    end
+    ensureFolder("TDSRecord")
+    ensureFolder("TDSRecord/strat")
+    local filename = "TDSRecord/strat/" .. strategyName .. ".txt"
+    pcall(function()
+        writefile(filename, content)
+        print("[RECORDER] Recording saved to: " .. filename)
+    end)
+end
+
+-- ============================================================
+-- Recording System
+-- ============================================================
+local RecordingSystem = {
+    isRecording      = false,
+    startTime        = 0,
+    events           = {},
+    placementCounter = 0,
+    towerInstances   = {},
+    matchEndConn     = nil,
+    monitorActive    = false,
+}
+
+local startRecording, stopRecording, monitorMatchEndRec, exportRecording
+
+-- Set by the GUI construction code further down, once the buttons/labels
+-- exist. Called whenever recording state changes -- whether from a button
+-- click or an automatic stop on match end -- so the UI never goes stale.
+local syncRecordUI = function() end
+
+local function getElapsedTime()
+    if not RecordingSystem.isRecording then return 0 end
+    return tick() - RecordingSystem.startTime
+end
+
+local function recordEvent(eventType, data)
+    if not RecordingSystem.isRecording then return end
+    table.insert(RecordingSystem.events, {
+        type = eventType,
+        time = getElapsedTime(),
+        data = data,
+    })
+    print("[RECORDING] " .. eventType .. " @ " .. string.format("%.2f", getElapsedTime()) .. "s")
+end
+
+local function registerTower(model)
+    RecordingSystem.placementCounter = RecordingSystem.placementCounter + 1
+    RecordingSystem.towerInstances[model] = RecordingSystem.placementCounter
+    return RecordingSystem.placementCounter
+end
+
+local function getTowerIndex(model)
+    return model and RecordingSystem.towerInstances[model] or -1
+end
+
+monitorMatchEndRec = function()
+    RecordingSystem.monitorActive = true
+    while RecordingSystem.monitorActive do
+        if RecordingSystem.matchEndConn then
+            RecordingSystem.matchEndConn:Disconnect()
+            RecordingSystem.matchEndConn = nil
+        end
+        local playerGui    = localPlayer:WaitForChild("PlayerGui")
+        local rewardsFrame = playerGui:FindFirstChild("ReactGameNewRewards")
+        if rewardsFrame then
+            local frame = rewardsFrame:FindFirstChild("Frame")
+            if frame then
+                local gameOver = frame:FindFirstChild("gameOver")
+                if gameOver then
+                    RecordingSystem.matchEndConn = gameOver:GetPropertyChangedSignal("Visible"):Connect(function()
+                        if gameOver.Visible and RecordingSystem.isRecording then
+                            print("[RECORDER] Match ended! Auto-stopping recording...")
+                            stopRecording()
+                        end
+                    end)
+                    return
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+startRecording = function()
+    RecordingSystem.isRecording      = true
+    RecordingSystem.startTime        = tick()
+    RecordingSystem.events           = {}
+    RecordingSystem.placementCounter = 0
+    RecordingSystem.towerInstances   = {}
+    print("[RECORDER] Recording started!")
+    print("[RECORDER] Triggering auto-skip to start match...")
+    task.wait(0.2)
+    autoSkip("RECORDER")
+    task.spawn(monitorMatchEndRec)
+end
+
+stopRecording = function()
+    RecordingSystem.monitorActive = false
+    RecordingSystem.isRecording   = false
+    if RecordingSystem.matchEndConn then
+        RecordingSystem.matchEndConn:Disconnect()
+        RecordingSystem.matchEndConn = nil
+    end
+    print("[RECORDER] Recording stopped! Total events: " .. #RecordingSystem.events)
+    syncRecordUI()
+end
+
+exportRecording = function()
+    local output = "=== TOWER DEFENSE RECORDING ===\n"
+    output = output .. "Total Events: " .. #RecordingSystem.events .. "\n"
+    local lastTime = RecordingSystem.events[#RecordingSystem.events]
+    output = output .. "Recording Duration: " .. string.format("%.2f", lastTime and lastTime.time or 0) .. "s\n"
+    output = output .. "================================\n\n"
+    for i, event in ipairs(RecordingSystem.events) do
+        output = output .. "[" .. i .. "] T+" .. string.format("%.2f", event.time) .. "s - " .. event.type .. "\n"
+        if event.data then
+            for k, v in pairs(event.data) do
+                output = output .. "    " .. k .. " = " .. tostring(v) .. "\n"
+            end
+        end
+        output = output .. "\n"
+    end
+    return output
+end
+
+-- ============================================================
+-- Playback System
+-- ============================================================
+local function parseRecording(content)
+    local events = {}
+    for line in content:gmatch("[^\r\n]+") do
+        local idx, time, eventType = line:match("^%[(%d+)%]%s+T%+([%d%.]+)s%s+%-%s+([%u_]+)")
+        if idx and time and eventType then
+            table.insert(events, { time = tonumber(time), type = eventType, data = {} })
+        else
+            local k, v = line:match("^%s*(%a+)%s*=%s*(.+)$")
+            if k and #events > 0 then
+                events[#events].data[k] = v
+            end
+        end
+    end
+    return events
+end
+
+local function loadRecording(strategyName)
+    local exists, path = fileExists(strategyName)
+    if not exists then return nil, "File does not exist: " .. path end
+    local ok, content = pcall(readfile, path)
+    if not ok then return nil, "Failed to read file" end
+    local events = parseRecording(content)
+    if #events == 0 then return nil, "No events found in file" end
+    return events
+end
+
+local function parseVector3(str)
+    local x, y, z = str:match("([%-%d%.]+),%s*([%-%d%.]+),%s*([%-%d%.]+)")
+    if x and y and z then return Vector3.new(tonumber(x), tonumber(y), tonumber(z)) end
+    return Vector3.new(0, 0, 0)
+end
+
+local PlaybackSystem = {
+    isPlaying           = false,
+    loopEnabled         = false,
+    currentEvents       = nil,
+    currentStrategyName = nil,
+    placedTowers        = {},
+    matchEndConn        = nil,
+    matchStart          = 0,
+    upgradeCounts       = {},   -- id -> number of upgrade events issued so far this playback
+    pendingPlacements   = {},   -- id -> true while a placement retry loop is still running
+    failedPlacements    = {},   -- id -> true once a placement permanently gives up
+}
+
+local startPlayback, stopPlayback, monitorMatchEndPlay, runPlayback
+
+-- Set by the GUI construction code further down. Called whenever playback
+-- state changes -- button click or automatic stop/restart on match end --
+-- so PLAY/STOP button text and status label never go stale.
+local syncPlayUI = function() end
+
+-- ============================================================
+-- Upgrade Level Verification
+-- ============================================================
+-- Reads the tower model's Upgrades folder to determine its actual
+-- current level: model.Upgrades.<level>.<part/meshpart> with
+-- Transparency == 0 at the active level, 1 everywhere else.
+local function getActualLevel(troop)
+    local upgrades = troop and troop:FindFirstChild("Upgrades")
+    if not upgrades then return nil end
+
+    for _, levelFolder in ipairs(upgrades:GetChildren()) do
+        local levelNum = tonumber(levelFolder.Name)
+        if levelNum then
+            for _, part in ipairs(levelFolder:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if part.Transparency == 0 then
+                        return levelNum
+                    end
+                    break -- one sample part per folder is enough
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Fires the upgrade call and verifies the tower actually reached
+-- expectedLevel via getActualLevel, retrying on mismatch. Runs in
+-- its own coroutine so it never blocks runPlayback's main loop --
+-- other towers' events keep firing on schedule while this retries.
+local function upgradeTowerWithRetry(id, troop, path, expectedLevel)
+    task.spawn(function()
+        local maxRetries = 5
+        local retryDelay = 0.5
+
+        for attempt = 1, maxRetries do
+            pcall(function()
+                TroopsChannel:InvokeServer("Upgrade", "Set", { Troop = troop, Path = path })
+            end)
+
+            task.wait(retryDelay)
+
+            local actualLevel = getActualLevel(troop)
+            if actualLevel == expectedLevel then
+                print("[PLAYBACK] Confirmed upgrade id=" .. id .. " -> level " .. expectedLevel)
+                return
+            end
+
+            warn("[PLAYBACK] Upgrade id=" .. id .. " not confirmed (got " ..
+                tostring(actualLevel) .. ", expected " .. expectedLevel ..
+                "), retry " .. attempt .. "/" .. maxRetries)
+        end
+
+        warn("[PLAYBACK] FAILED to confirm upgrade id=" .. id .. " -> level " ..
+            expectedLevel .. " after " .. maxRetries .. " attempts")
+    end)
+end
+
+-- ============================================================
+-- Placement Verification & Retry
+-- ============================================================
+-- TroopsChannel:InvokeServer("Place", ...) returns an Instance on
+-- success, or a string error message on failure (e.g. "not enough
+-- money"). Retries on failure since every later event for this id
+-- (upgrades, sells, abilities...) depends on placedTowers[id] being
+-- set -- a single missed placement would silently break the rest of
+-- that tower's timeline.
+local function placeTowerWithRetry(id, towerName, pos)
+    PlaybackSystem.pendingPlacements[id] = true
+
+    task.spawn(function()
+        local maxRetries = 8
+        local retryDelay = 1.0
+
+        for attempt = 1, maxRetries do
+            if not PlaybackSystem.isPlaying then
+                PlaybackSystem.pendingPlacements[id] = nil
+                return
+            end
+
+            local ok, result = pcall(function()
+                return TroopsChannel:InvokeServer("Place", {
+                    Position = pos,
+                    Rotation = CFrame.Angles(0, 0, 0),
+                }, towerName)
+            end)
+
+            if ok and result and typeof(result) == "Instance" then
+                PlaybackSystem.placedTowers[id]      = result
+                PlaybackSystem.pendingPlacements[id] = nil
+                print("[PLAYBACK] Placed " .. towerName .. " (id=" .. id .. ") on attempt " .. attempt)
+                return
+            end
+
+            -- result is the server's string reason on failure (e.g. "not enough money")
+            warn("[PLAYBACK] Place failed for " .. towerName .. " (id=" .. id .. "): " ..
+                tostring(result) .. " -- retry " .. attempt .. "/" .. maxRetries)
+
+            task.wait(retryDelay)
+        end
+
+        PlaybackSystem.pendingPlacements[id] = nil
+        PlaybackSystem.failedPlacements[id]  = true
+        warn("[PLAYBACK] GIVING UP on placing " .. towerName .. " (id=" .. id ..
+            ") after " .. maxRetries .. " attempts -- later events for this id will be skipped")
+    end)
+end
+
+-- Other event branches (upgrade/sell/target/ability/option) call this
+-- instead of reading PlaybackSystem.placedTowers[id] directly, so they
+-- wait out an in-progress placement retry rather than failing the
+-- instant they're checked (which would happen almost every time, since
+-- those events follow PLACE_TOWER by mere fractions of a second).
+local function waitForTower(id)
+    if PlaybackSystem.failedPlacements[id] then
+        return nil -- placement already permanently gave up, don't bother waiting
+    end
+
+    while PlaybackSystem.pendingPlacements[id] and PlaybackSystem.isPlaying do
+        task.wait(0.1)
+    end
+
+    return PlaybackSystem.placedTowers[id]
+end
+
+local function executeEvent(event)
+    local data = event.data
+
+    if event.type == "PLACE_TOWER" then
+        local pos       = parseVector3(data.position or "0, 0, 0")
+        local towerName = data.name or "Unknown"
+        local id        = tonumber(data.id) or -1
+        placeTowerWithRetry(id, towerName, pos)
+
+    elseif event.type == "UPGRADE_TOWER" then
+        local id    = tonumber(data.id) or -1
+        local path  = tonumber(data.path) or 1
+        task.spawn(function()
+            local troop = waitForTower(id)
+            if troop then
+                PlaybackSystem.upgradeCounts[id] = (PlaybackSystem.upgradeCounts[id] or 0) + 1
+                local expectedLevel = PlaybackSystem.upgradeCounts[id]
+                upgradeTowerWithRetry(id, troop, path, expectedLevel)
+            else
+                warn("[PLAYBACK] Cannot upgrade, tower id=" .. id .. " not found")
+            end
+        end)
+
+    elseif event.type == "SELL_TOWER" then
+        local id = tonumber(data.id) or -1
+        task.spawn(function()
+            local troop = waitForTower(id)
+            if troop then
+                pcall(function() TroopsChannel:InvokeServer("Sell", { Troop = troop }) end)
+                print("[PLAYBACK] Sold tower id=" .. id)
+                PlaybackSystem.placedTowers[id] = nil
+            else
+                warn("[PLAYBACK] Cannot sell, tower id=" .. id .. " not found")
+            end
+        end)
+
+    elseif event.type == "SET_TARGET" then
+        local id     = tonumber(data.id) or -1
+        local target = data.target or "First"
+        task.spawn(function()
+            local troop = waitForTower(id)
+            if troop then
+                pcall(function() TroopsChannel:InvokeServer("Target", "Set", { Troop = troop, Target = target }) end)
+                print("[PLAYBACK] Set target tower id=" .. id .. " -> " .. target)
+            end
+        end)
+
+    elseif event.type == "USE_ABILITY" then
+        local id      = tonumber(data.id) or -1
+        local ability = data.ability or "Unknown"
+        task.spawn(function()
+            local troop = waitForTower(id)
+            if troop then
+                pcall(function() TroopsChannel:InvokeServer("Abilities", "Activate", { Name = ability, Troop = troop, Data = {} }) end)
+                print("[PLAYBACK] Used ability " .. ability .. " on tower id=" .. id)
+            end
+        end)
+
+    elseif event.type == "SET_OPTION" then
+        local id          = tonumber(data.id) or -1
+        local optionName  = data.option or "Unknown"
+        local optionValue = data.value
+        task.spawn(function()
+            local troop = waitForTower(id)
+            if troop then
+                pcall(function() TroopsChannel:InvokeServer("Option", "Set", { Troop = troop, Name = optionName, Value = optionValue }) end)
+                print("[PLAYBACK] Set option " .. optionName .. " on tower id=" .. id)
+            end
+        end)
+
+    elseif event.type == "SKIP_VOTE" then
+        autoSkip("PLAYER")
+    end
+end
+
+runPlayback = function()
+    local events = PlaybackSystem.currentEvents
+    if not events then return end
+    local matchStart = PlaybackSystem.matchStart
+    for _, event in ipairs(events) do
+        if not PlaybackSystem.isPlaying then return end
+        local waitTime = event.time - (tick() - matchStart)
+        if waitTime > 0 then task.wait(waitTime) end
+        if not PlaybackSystem.isPlaying then return end
+        executeEvent(event)
+    end
+    print("[PLAYBACK] Finished executing all events.")
+end
+
+monitorMatchEndPlay = function()
+    if PlaybackSystem.matchEndConn then
+        PlaybackSystem.matchEndConn:Disconnect()
+        PlaybackSystem.matchEndConn = nil
+    end
+    while PlaybackSystem.isPlaying do
+        local playerGui    = localPlayer:WaitForChild("PlayerGui")
+        local rewardsFrame = playerGui:FindFirstChild("ReactGameNewRewards")
+        if rewardsFrame then
+            local frame = rewardsFrame:FindFirstChild("Frame")
+            if frame then
+                local gameOver = frame:FindFirstChild("gameOver")
+                if gameOver then
+                    PlaybackSystem.matchEndConn = gameOver:GetPropertyChangedSignal("Visible"):Connect(function()
+                        if gameOver.Visible and PlaybackSystem.isPlaying then
+                            print("[PLAYER] Match ended!")
+                            if PlaybackSystem.loopEnabled then
+                                print("[PLAYER] Loop enabled, restarting playback...")
+                                syncPlayUI("RESTARTING")
+                                task.wait(3)
+                                if PlaybackSystem.isPlaying then
+                                    startPlayback(PlaybackSystem.currentStrategyName, true)
+                                    syncPlayUI()
+                                end
+                            else
+                                stopPlayback()
+                            end
+                        end
+                    end)
+                    return
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+startPlayback = function(strategyName, skipFileCheck)
+    if not skipFileCheck then
+        local events, err = loadRecording(strategyName)
+        if not events then
+            warn("[PLAYER] " .. err)
+            return false, err
+        end
+        PlaybackSystem.currentEvents       = events
+        PlaybackSystem.currentStrategyName = strategyName
+    end
+    PlaybackSystem.isPlaying          = true
+    PlaybackSystem.placedTowers       = {}
+    PlaybackSystem.upgradeCounts      = {}
+    PlaybackSystem.pendingPlacements  = {}
+    PlaybackSystem.failedPlacements   = {}
+    print("[PLAYER] Starting playback: " .. strategyName)
+    print("[PLAYER] Triggering auto-skip to start match...")
+
+    -- Snapshot matchStart BEFORE the wait/skip sequence, mirroring
+    -- how the recorder captures startTime before its own wait/skip --
+    -- keeps both clocks' T+0 anchored to the same logical point.
+    PlaybackSystem.matchStart = tick()
+
+    task.wait(0.2)
+    autoSkip("PLAYER")
+    task.spawn(runPlayback)
+    task.spawn(monitorMatchEndPlay)
+    return true
+end
+
+stopPlayback = function()
+    PlaybackSystem.isPlaying = false
+    if PlaybackSystem.matchEndConn then
+        PlaybackSystem.matchEndConn:Disconnect()
+        PlaybackSystem.matchEndConn = nil
+    end
+    print("[PLAYER] Playback stopped.")
+    syncPlayUI()
+end
+
+-- ============================================================
+-- GUI Parent Resolution
+-- ============================================================
+local PARENT            = nil
+local MAX_DISPLAY_ORDER = 2147483647
+
+if get_hidden_gui or gethui then
+    local hiddenUI = get_hidden_gui or gethui
+    local Main = Instance.new("ScreenGui")
+    Main.Name         = randomString()
+    Main.ResetOnSpawn = false
+    Main.DisplayOrder = MAX_DISPLAY_ORDER
+    Main.Parent       = hiddenUI()
+    PARENT = Main
+
+elseif (not is_sirhurt_closure) and (syn and syn.protect_gui) then
+    local Main = Instance.new("ScreenGui")
+    Main.Name         = randomString()
+    Main.ResetOnSpawn = false
+    Main.DisplayOrder = MAX_DISPLAY_ORDER
+    syn.protect_gui(Main)
+    Main.Parent = COREGUI
+    PARENT = Main
+
+elseif COREGUI:FindFirstChild("RobloxGui") then
+    PARENT = COREGUI.RobloxGui
+
+else
+    local Main = Instance.new("ScreenGui")
+    Main.Name         = randomString()
+    Main.ResetOnSpawn = false
+    Main.DisplayOrder = MAX_DISPLAY_ORDER
+    Main.Parent       = COREGUI
+    PARENT = Main
+end
+
+-- ============================================================
+-- Layout Constants
+-- ============================================================
+local MINI_HEIGHT = 42
+-- Recorder panel height
+local REC_FULL_HEIGHT  = 420
+-- Player panel height
+local PLAY_FULL_HEIGHT = 320
+
+local minimized    = false
+local activeTab    = "RECORDER"  -- or "PLAYER"
+
+-- ============================================================
+-- Root Frame
+-- ============================================================
+local Frame = Instance.new("Frame")
+Frame.Parent           = PARENT
+Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+Frame.BorderSizePixel  = 0
+Frame.Position         = UDim2.new(0.60, 0, 0.05, 0)
+Frame.Size             = UDim2.new(0, 320, 0, REC_FULL_HEIGHT)
+Frame.Active           = true
+Frame.ZIndex           = 10
+Frame.ClipsDescendants = true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 10)
+
+-- ── Title ──────────────────────────────────────────────────
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Parent                = Frame
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Position              = UDim2.new(0, 12, 0, 8)
+TitleLabel.Size                  = UDim2.new(1, -50, 0, 24)
+TitleLabel.Font                  = Enum.Font.GothamBold
+TitleLabel.Text                  = "🎮 TDS Recorder + Player"
+TitleLabel.TextColor3            = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextXAlignment        = Enum.TextXAlignment.Left
+TitleLabel.TextSize              = 14
+TitleLabel.ZIndex                = 10
+
+-- ── Minimize Button ────────────────────────────────────────
+local MinimizeButton = Instance.new("TextButton")
+MinimizeButton.Parent           = Frame
+MinimizeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+MinimizeButton.BorderSizePixel  = 0
+MinimizeButton.Position         = UDim2.new(1, -36, 0, 8)
+MinimizeButton.Size             = UDim2.new(0, 26, 0, 26)
+MinimizeButton.Font             = Enum.Font.GothamBold
+MinimizeButton.Text             = "−"
+MinimizeButton.TextColor3       = Color3.fromRGB(255, 255, 255)
+MinimizeButton.TextSize         = 18
+MinimizeButton.ZIndex           = 11
+Instance.new("UICorner", MinimizeButton).CornerRadius = UDim.new(0, 6)
+
+-- ── Tab Bar ────────────────────────────────────────────────
+local TAB_Y = 40
+local TAB_H = 30
+
+local TabBarBg = Instance.new("Frame")
+TabBarBg.Parent           = Frame
+TabBarBg.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+TabBarBg.BorderSizePixel  = 0
+TabBarBg.Position         = UDim2.new(0, 0, 0, TAB_Y)
+TabBarBg.Size             = UDim2.new(1, 0, 0, TAB_H)
+TabBarBg.ZIndex           = 10
+
+local TabRecorder = Instance.new("TextButton")
+TabRecorder.Parent           = TabBarBg
+TabRecorder.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
+TabRecorder.BorderSizePixel  = 0
+TabRecorder.Position         = UDim2.new(0, 4, 0.1, 0)
+TabRecorder.Size             = UDim2.new(0.5, -6, 0.8, 0)
+TabRecorder.Font             = Enum.Font.GothamBold
+TabRecorder.Text             = "🎥 RECORDER"
+TabRecorder.TextColor3       = Color3.fromRGB(255, 255, 255)
+TabRecorder.TextSize         = 11
+TabRecorder.ZIndex           = 11
+Instance.new("UICorner", TabRecorder).CornerRadius = UDim.new(0, 5)
+
+local TabPlayer = Instance.new("TextButton")
+TabPlayer.Parent           = TabBarBg
+TabPlayer.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+TabPlayer.BorderSizePixel  = 0
+TabPlayer.Position         = UDim2.new(0.5, 2, 0.1, 0)
+TabPlayer.Size             = UDim2.new(0.5, -6, 0.8, 0)
+TabPlayer.Font             = Enum.Font.GothamBold
+TabPlayer.Text             = "▶ PLAYER"
+TabPlayer.TextColor3       = Color3.fromRGB(180, 180, 180)
+TabPlayer.TextSize         = 11
+TabPlayer.ZIndex           = 11
+Instance.new("UICorner", TabPlayer).CornerRadius = UDim.new(0, 5)
+
+-- ── Content offset below tab bar ───────────────────────────
+local CONTENT_Y = TAB_Y + TAB_H + 4   -- 74
+
+-- ============================================================
+-- Shared UI Factories  (all parented to Frame, use yPos relative to Frame top)
+-- ============================================================
+local function makeDivider(parent, yPos)
+    local d = Instance.new("Frame")
+    d.Parent           = parent
+    d.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+    d.BorderSizePixel  = 0
+    d.Position         = UDim2.new(0.05, 0, 0, yPos)
+    d.Size             = UDim2.new(0.90, 0, 0, 1)
+    d.ZIndex           = 10
+    return d
+end
+
+local function makeCategoryHeader(parent, icon, text, yPos, accentColor)
+    local bg = Instance.new("Frame")
+    bg.Parent           = parent
+    bg.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    bg.BorderSizePixel  = 0
+    bg.Position         = UDim2.new(0.05, 0, 0, yPos)
+    bg.Size             = UDim2.new(0.90, 0, 0, 22)
+    bg.ZIndex           = 10
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 4)
+    local accent = Instance.new("Frame")
+    accent.Parent           = bg
+    accent.BackgroundColor3 = accentColor
+    accent.BorderSizePixel  = 0
+    accent.Position         = UDim2.new(0, 0, 0.1, 0)
+    accent.Size             = UDim2.new(0, 3, 0.8, 0)
+    accent.ZIndex           = 11
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+    local lbl = Instance.new("TextLabel")
+    lbl.Parent                = bg
+    lbl.BackgroundTransparency = 1
+    lbl.Position              = UDim2.new(0, 10, 0, 0)
+    lbl.Size                  = UDim2.new(1, -10, 1, 0)
+    lbl.Font                  = Enum.Font.GothamBold
+    lbl.Text                  = icon .. "  " .. text
+    lbl.TextColor3            = Color3.fromRGB(210, 210, 210)
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.TextSize              = 11
+    lbl.ZIndex                = 11
+    return bg
+end
+
+local function makeLabel(parent, text, yPos, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Parent                = parent
+    lbl.BackgroundTransparency = 1
+    lbl.Position              = UDim2.new(0.05, 0, 0, yPos)
+    lbl.Size                  = UDim2.new(0.90, 0, 0, 18)
+    lbl.Font                  = Enum.Font.Gotham
+    lbl.Text                  = text
+    lbl.TextColor3            = color or Color3.fromRGB(170, 170, 170)
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.TextSize              = 11
+    lbl.ZIndex                = 10
+    return lbl
+end
+
+local function makeTextBox(parent, yPos, placeholder, textColor)
+    local tb = Instance.new("TextBox")
+    tb.Parent            = parent
+    tb.BackgroundColor3  = Color3.fromRGB(48, 48, 48)
+    tb.BorderSizePixel   = 0
+    tb.Position          = UDim2.new(0.05, 0, 0, yPos)
+    tb.Size              = UDim2.new(0.90, 0, 0, 28)
+    tb.Font              = Enum.Font.Gotham
+    tb.Text              = ""
+    tb.PlaceholderText   = placeholder
+    tb.PlaceholderColor3 = Color3.fromRGB(110, 110, 110)
+    tb.TextColor3        = textColor or Color3.fromRGB(255, 220, 80)
+    tb.TextSize          = 12
+    tb.ClearTextOnFocus  = false
+    tb.ZIndex            = 11
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 6)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = Color3.fromRGB(70, 70, 70)
+    stroke.Thickness = 1
+    stroke.Parent    = tb
+    return tb, stroke
+end
+
+local function makeButton(parent, text, yPos, bgColor)
+    local btn = Instance.new("TextButton")
+    btn.Parent           = parent
+    btn.BackgroundColor3 = bgColor
+    btn.BorderSizePixel  = 0
+    btn.Position         = UDim2.new(0.05, 0, 0, yPos)
+    btn.Size             = UDim2.new(0.90, 0, 0, 36)
+    btn.Font             = Enum.Font.GothamBold
+    btn.Text             = text
+    btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    btn.TextSize         = 13
+    btn.ZIndex           = 10
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    return btn
+end
+
+local function makeToggle(parent, text, yPos)
+    local container = Instance.new("Frame")
+    container.Parent              = parent
+    container.BackgroundTransparency = 1
+    container.Position            = UDim2.new(0.05, 0, 0, yPos)
+    container.Size                = UDim2.new(0.90, 0, 0, 28)
+    container.ZIndex              = 10
+    local lbl = Instance.new("TextLabel")
+    lbl.Parent              = container
+    lbl.BackgroundTransparency = 1
+    lbl.Position            = UDim2.new(0, 0, 0, 0)
+    lbl.Size                = UDim2.new(0.6, 0, 1, 0)
+    lbl.Font                = Enum.Font.Gotham
+    lbl.Text                = text
+    lbl.TextColor3          = Color3.fromRGB(200, 200, 200)
+    lbl.TextXAlignment      = Enum.TextXAlignment.Left
+    lbl.TextSize            = 12
+    lbl.ZIndex              = 10
+    local btn = Instance.new("TextButton")
+    btn.Parent           = container
+    btn.BackgroundColor3 = Color3.fromRGB(160, 80, 0)
+    btn.BorderSizePixel  = 0
+    btn.Position         = UDim2.new(0.7, 0, 0, 0)
+    btn.Size             = UDim2.new(0.3, 0, 1, 0)
+    btn.Font             = Enum.Font.GothamBold
+    btn.Text             = "OFF"
+    btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    btn.TextSize         = 12
+    btn.ZIndex           = 10
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    return btn, container
+end
+
+-- ============================================================
+-- Recorder Panel
+-- ============================================================
+local RecPanel = Instance.new("Frame")
+RecPanel.Parent              = Frame
+RecPanel.BackgroundTransparency = 1
+RecPanel.Position            = UDim2.new(0, 0, 0, CONTENT_Y)
+RecPanel.Size                = UDim2.new(1, 0, 1, -CONTENT_Y)
+RecPanel.ZIndex              = 10
+RecPanel.ClipsDescendants    = false
+
+local y = 2  -- local y offsets inside RecPanel
+
+makeCategoryHeader(RecPanel, "🎥", "RECORDING", y, Color3.fromRGB(220, 80, 80))
+y = y + 28
+
+local RecStatusLabel  = makeLabel(RecPanel, "Status: IDLE", y, Color3.fromRGB(100, 200, 100))
+y = y + 26
+local RecordButton    = makeButton(RecPanel, "START RECORDING", y, Color3.fromRGB(50, 150, 50))
+y = y + 44
+local CounterLabel    = makeLabel(RecPanel, "Events Recorded: 0", y, Color3.fromRGB(150, 200, 255))
+y = y + 30
+makeDivider(RecPanel, y)
+y = y + 10
+makeCategoryHeader(RecPanel, "💾", "SAVE TO FILE", y, Color3.fromRGB(200, 150, 80))
+y = y + 28
+local RecStratBox, _  = makeTextBox(RecPanel, y, "Strategy name (e.g. record1)", Color3.fromRGB(255, 200, 80))
+y = y + 36
+local SaveButton      = makeButton(RecPanel, "SAVE RECORDING", y, Color3.fromRGB(180, 120, 0))
+y = y + 44
+makeDivider(RecPanel, y)
+y = y + 10
+makeCategoryHeader(RecPanel, "📊", "EXPORT", y, Color3.fromRGB(80, 150, 220))
+y = y + 28
+local ExportButton    = makeButton(RecPanel, "EXPORT TO CLIPBOARD", y, Color3.fromRGB(0, 100, 180))
+y = y + 44
+local ClearButton     = makeButton(RecPanel, "CLEAR RECORDING", y, Color3.fromRGB(150, 100, 50))
+
+-- ============================================================
+-- Player Panel
+-- ============================================================
+local PlayPanel = Instance.new("Frame")
+PlayPanel.Parent              = Frame
+PlayPanel.BackgroundTransparency = 1
+PlayPanel.Position            = UDim2.new(0, 0, 0, CONTENT_Y)
+PlayPanel.Size                = UDim2.new(1, 0, 1, -CONTENT_Y)
+PlayPanel.ZIndex              = 10
+PlayPanel.ClipsDescendants    = false
+PlayPanel.Visible             = false
+
+local py = 2
+
+makeDivider(PlayPanel, py)
+py = py + 10
+local PlayStratBox, _ = makeTextBox(PlayPanel, py, "Strategy name to load", Color3.fromRGB(255, 200, 80))
+py = py + 36
+local PlayStatusLabel = makeLabel(PlayPanel, "Status: IDLE", py, Color3.fromRGB(100, 200, 100))
+py = py + 26
+local LoopButton, _   = makeToggle(PlayPanel, "Loop after match end", py)
+py = py + 36
+local PlayButton      = makeButton(PlayPanel, "▶ PLAY", py, Color3.fromRGB(50, 150, 50))
+py = py + 44
+local StopButton      = makeButton(PlayPanel, "■ STOP", py, Color3.fromRGB(180, 50, 50))
+py = py + 44
+makeDivider(PlayPanel, py)
+py = py + 10
+makeLabel(PlayPanel, "Files are read from:", py, Color3.fromRGB(150, 150, 150))
+py = py + 20
+makeLabel(PlayPanel, "TDSRecord/strat/<name>.txt", py, Color3.fromRGB(150, 200, 255))
+
+-- ============================================================
+-- Tab Switching
+-- ============================================================
+local function setTab(tab)
+    activeTab = tab
+    if tab == "RECORDER" then
+        RecPanel.Visible  = true
+        PlayPanel.Visible = false
+        TabRecorder.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
+        TabRecorder.TextColor3       = Color3.fromRGB(255, 255, 255)
+        TabPlayer.BackgroundColor3   = Color3.fromRGB(45, 45, 45)
+        TabPlayer.TextColor3         = Color3.fromRGB(180, 180, 180)
+        if not minimized then
+            Frame.Size = UDim2.new(0, 320, 0, REC_FULL_HEIGHT)
+        end
+    else
+        RecPanel.Visible  = false
+        PlayPanel.Visible = true
+        TabPlayer.BackgroundColor3   = Color3.fromRGB(50, 120, 200)
+        TabPlayer.TextColor3         = Color3.fromRGB(255, 255, 255)
+        TabRecorder.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+        TabRecorder.TextColor3       = Color3.fromRGB(180, 180, 180)
+        if not minimized then
+            Frame.Size = UDim2.new(0, 320, 0, PLAY_FULL_HEIGHT)
+        end
+    end
+end
+
+TabRecorder.MouseButton1Click:Connect(function() setTab("RECORDER") end)
+TabPlayer.MouseButton1Click:Connect(function()   setTab("PLAYER")   end)
+
+-- ============================================================
+-- Dragging
+-- ============================================================
+local function dragGUI(gui)
+    local dragging, dragInput, dragStart, startPos
+
+    gui.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = gui.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    gui.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            gui.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+dragGUI(Frame)
+
+-- ============================================================
+-- Minimize
+-- ============================================================
+MinimizeButton.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        MinimizeButton.Text = "+"
+        Frame.Size = UDim2.new(0, 320, 0, MINI_HEIGHT)
+    else
+        MinimizeButton.Text = "−"
+        local fullH = activeTab == "RECORDER" and REC_FULL_HEIGHT or PLAY_FULL_HEIGHT
+        Frame.Size = UDim2.new(0, 320, 0, fullH)
+    end
+end)
+
+-- ============================================================
+-- Recorder Event Handlers
+-- ============================================================
+-- Reassigns the forward-declared upvalue so stopRecording() (called
+-- either by a button click or automatically on match end) can drive
+-- the same UI update path as a manual click.
+syncRecordUI = function()
+    if RecordingSystem.isRecording then
+        RecordButton.Text             = "STOP RECORDING"
+        RecordButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+        RecStatusLabel.Text           = "Status: RECORDING"
+        RecStatusLabel.TextColor3     = Color3.fromRGB(255, 100, 100)
+    else
+        RecordButton.Text             = "START RECORDING"
+        RecordButton.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+        RecStatusLabel.Text           = "Status: IDLE"
+        RecStatusLabel.TextColor3     = Color3.fromRGB(100, 200, 100)
+    end
+end
+
+RecordButton.MouseButton1Click:Connect(function()
+    if RecordingSystem.isRecording then
+        stopRecording()  -- also calls syncRecordUI() internally
+    else
+        startRecording()
+        syncRecordUI()
+    end
+end)
+
+SaveButton.MouseButton1Click:Connect(function()
+    local name   = RecStratBox.Text
+    local output = exportRecording()
+    saveRecording(name, output)
+end)
+
+ExportButton.MouseButton1Click:Connect(function()
+    local output = exportRecording()
+    if setclipboard then
+        setclipboard(output)
+        print("[RECORDER] Recording exported to clipboard!")
+    end
+end)
+
+ClearButton.MouseButton1Click:Connect(function()
+    RecordingSystem.events           = {}
+    RecordingSystem.placementCounter = 0
+    RecordingSystem.towerInstances   = {}
+    CounterLabel.Text                = "Events Recorded: 0"
+    print("[RECORDER] Recording cleared!")
+end)
+
+-- ============================================================
+-- Player Event Handlers
+-- ============================================================
+-- Same pattern as syncRecordUI: stopPlayback()/loop-restart call this
+-- so STOP/PLAY state and the status label stay correct even when the
+-- stop was triggered automatically by match end, not a button click.
+syncPlayUI = function(overrideStatus)
+    if overrideStatus == "RESTARTING" then
+        PlayStatusLabel.Text       = "Status: RESTARTING..."
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+        return
+    end
+
+    if PlaybackSystem.isPlaying then
+        PlayStatusLabel.Text       = "Status: PLAYING"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    else
+        PlayStatusLabel.Text       = "Status: STOPPED"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
+    end
+end
+
+LoopButton.MouseButton1Click:Connect(function()
+    PlaybackSystem.loopEnabled       = not PlaybackSystem.loopEnabled
+    LoopButton.Text                  = PlaybackSystem.loopEnabled and "ON" or "OFF"
+    LoopButton.BackgroundColor3      = PlaybackSystem.loopEnabled
+        and Color3.fromRGB(0, 150, 80)
+        or  Color3.fromRGB(160, 80, 0)
+end)
+
+PlayButton.MouseButton1Click:Connect(function()
+    local strategyName = PlayStratBox.Text
+    if strategyName == "" then
+        PlayStatusLabel.Text      = "Status: ENTER A NAME"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        return
+    end
+    local exists, path = fileExists(strategyName)
+    if not exists then
+        PlayStatusLabel.Text       = "Status: FILE NOT FOUND"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        print("[PLAYER] File does not exist: " .. path)
+        return
+    end
+    if PlaybackSystem.isPlaying then
+        PlayStatusLabel.Text       = "Status: ALREADY PLAYING"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+        return
+    end
+    local success, err = startPlayback(strategyName)
+    if success then
+        syncPlayUI()
+    else
+        PlayStatusLabel.Text       = "Status: ERROR"
+        PlayStatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        print("[PLAYER] " .. tostring(err))
+    end
+end)
+
+StopButton.MouseButton1Click:Connect(function()
+    stopPlayback()  -- also calls syncPlayUI() internally
+end)
+
+-- ============================================================
+-- Heartbeat Updates
+-- ============================================================
+RunService.Heartbeat:Connect(function()
+    if RecordingSystem.isRecording then
+        CounterLabel.Text = "Events Recorded: " .. #RecordingSystem.events
+    end
+end)
+
+-- ============================================================
+-- Remote Hooks (Recorder)
+-- ============================================================
+local oldNamecall
+oldNamecall = hookfunction(getrawmetatable(game).__namecall, function(self, ...)
+    local method = getnamecallmethod()
+    local result = oldNamecall(self, ...)
+
+    if not RecordingSystem.isRecording then
+        return result
+    end
+
+    local args = { ... }
+
+    if method == "InvokeServer" then
+        if args[1] == "Troops" then
+
+            if args[2] == "Place" then
+                local towerName = args[4] or "Unknown"
+                local index
+                if result and typeof(result) == "Instance" then
+                    index = registerTower(result)
+                end
+                recordEvent("PLACE_TOWER", {
+                    id       = index or -1,
+                    name     = towerName,
+                    position = args[3] and tostring(args[3].Position) or "Unknown",
+                })
+
+            elseif args[2] == "Upgrade" and args[3] == "Set" then
+                local troop = args[4] and args[4].Troop
+                local path  = args[4] and args[4].Path or 0
+                recordEvent("UPGRADE_TOWER", { id = getTowerIndex(troop), path = path })
+
+            elseif args[2] == "Sell" then
+                local troop = args[3] and args[3].Troop
+                recordEvent("SELL_TOWER", { id = getTowerIndex(troop) })
+
+            elseif args[2] == "Target" and args[3] == "Set" then
+                local troop  = args[4] and args[4].Troop
+                local target = args[4] and args[4].Target or "Unknown"
+                recordEvent("SET_TARGET", { id = getTowerIndex(troop), target = target })
+
+            elseif args[2] == "Abilities" and args[3] == "Activate" then
+                local troop       = args[4] and args[4].Troop
+                local abilityName = args[4] and args[4].Name or "Unknown"
+                local data        = args[4] and args[4].Data
+                local dataStr     = "{}"
+                if data and next(data) then
+                    local parts = {}
+                    for k, v in pairs(data) do
+                        table.insert(parts, tostring(k) .. "=" .. tostring(v))
+                    end
+                    dataStr = "{ " .. table.concat(parts, ", ") .. " }"
+                end
+                recordEvent("USE_ABILITY", { id = getTowerIndex(troop), ability = abilityName, data = dataStr })
+
+            elseif args[2] == "Option" and args[3] == "Set" then
+                local troop       = args[4] and args[4].Troop
+                local optionName  = args[4] and args[4].Name or "Unknown"
+                local optionValue = args[4] and args[4].Value
+                recordEvent("SET_OPTION", { id = getTowerIndex(troop), option = optionName, value = tostring(optionValue) })
+            end
+
+        elseif args[1] == "Voting" and args[2] == "Skip" then
+            recordEvent("SKIP_VOTE", { action = "Skip" })
+        end
+    end
+
+    return result
+end)
+
+-- ============================================================
+-- Init
+-- ============================================================
+setTab("RECORDER")
+print("[TDS] Merged Recorder + Player loaded!")
