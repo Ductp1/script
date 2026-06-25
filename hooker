@@ -1,0 +1,476 @@
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+-- ============================================================
+-- ENVIRONMENT HELPERS
+-- ============================================================
+function missing(t, f, fallback)
+    if type(f) == t then return f end
+    return fallback
+end
+
+cloneref = missing("function", cloneref, function(x) return x end)
+
+local COREGUI     = cloneref(game:GetService("CoreGui"))
+local localPlayer = Players.LocalPlayer
+local minimized    = false
+
+function randomString()
+    local length = math.random(10, 20)
+    local array  = {}
+    for i = 1, length do
+        array[i] = string.char(math.random(32, 126))
+    end
+    return table.concat(array)
+end
+
+-- ============================================================
+-- GUI PARENTING
+-- ============================================================
+local PARENT             = nil
+local MAX_DISPLAY_ORDER   = 2147483647
+
+if get_hidden_gui or gethui then
+    local hiddenUI = get_hidden_gui or gethui
+    local Main = Instance.new("ScreenGui")
+    Main.Name          = randomString()
+    Main.ResetOnSpawn  = false
+    Main.DisplayOrder  = MAX_DISPLAY_ORDER
+    Main.Parent        = hiddenUI()
+    PARENT = Main
+
+elseif (not is_sirhurt_closure) and (syn and syn.protect_gui) then
+    local Main = Instance.new("ScreenGui")
+    Main.Name          = randomString()
+    Main.ResetOnSpawn  = false
+    Main.DisplayOrder  = MAX_DISPLAY_ORDER
+    syn.protect_gui(Main)
+    Main.Parent = COREGUI
+    PARENT = Main
+
+elseif COREGUI:FindFirstChild("RobloxGui") then
+    PARENT = COREGUI.RobloxGui
+
+else
+    local Main = Instance.new("ScreenGui")
+    Main.Name          = randomString()
+    Main.ResetOnSpawn  = false
+    Main.DisplayOrder  = MAX_DISPLAY_ORDER
+    Main.Parent        = COREGUI
+    PARENT = Main
+end
+
+-- ============================================================
+-- LAYOUT REFERENCE
+-- ============================================================
+--  y=0    Title + minimize
+--  y=40   Divider
+--  y=46   📡 REMOTE SPY header
+--  y=76   "FireServer filter" label
+--  y=96   FireServer filter textbox    (h=28)
+--  y=130  FireServer toggle button     (h=36)
+--  y=174  Divider
+--  y=180  "InvokeServer filter" label
+--  y=200  InvokeServer filter textbox (h=28)
+--  y=234  InvokeServer toggle button  (h=36)
+--  y=278  Divider
+-- ============================================================
+
+local FULL_HEIGHT = 320
+local MINI_HEIGHT = 42
+
+local Frame = Instance.new("Frame")
+Frame.Parent             = PARENT
+Frame.BackgroundColor3   = Color3.fromRGB(30, 30, 30)
+Frame.BorderSizePixel    = 0
+Frame.Position           = UDim2.new(0.60, 0, 0.05, 0)
+Frame.Size               = UDim2.new(0, 280, 0, FULL_HEIGHT)
+Frame.Active             = true
+Frame.ZIndex             = 10
+Frame.ClipsDescendants   = true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 10)
+
+-- ── Title ──────────────────────────────────────────────────
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Parent           = Frame
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Position         = UDim2.new(0, 12, 0, 8)
+TitleLabel.Size             = UDim2.new(1, -50, 0, 24)
+TitleLabel.Font             = Enum.Font.GothamBold
+TitleLabel.Text             = "📡 Remote Spy"
+TitleLabel.TextColor3       = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextXAlignment   = Enum.TextXAlignment.Left
+TitleLabel.TextSize         = 15
+TitleLabel.ZIndex           = 10
+
+-- ── Minimize button ────────────────────────────────────────
+local MinimizeButton = Instance.new("TextButton")
+MinimizeButton.Parent           = Frame
+MinimizeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+MinimizeButton.BorderSizePixel  = 0
+MinimizeButton.Position         = UDim2.new(1, -36, 0, 8)
+MinimizeButton.Size             = UDim2.new(0, 26, 0, 26)
+MinimizeButton.Font             = Enum.Font.GothamBold
+MinimizeButton.Text             = "−"
+MinimizeButton.TextColor3       = Color3.fromRGB(255, 255, 255)
+MinimizeButton.TextSize         = 18
+MinimizeButton.ZIndex           = 11
+Instance.new("UICorner", MinimizeButton).CornerRadius = UDim.new(0, 6)
+
+-- ============================================================
+-- SHARED UI FACTORIES
+-- ============================================================
+local function makeDivider(yPos)
+    local d = Instance.new("Frame")
+    d.Parent           = Frame
+    d.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+    d.BorderSizePixel  = 0
+    d.Position         = UDim2.new(0.05, 0, 0, yPos)
+    d.Size             = UDim2.new(0.9, 0, 0, 1)
+    d.ZIndex           = 10
+    return d
+end
+
+local function makeCategoryHeader(icon, text, yPos, accentColor)
+    local bg = Instance.new("Frame")
+    bg.Parent           = Frame
+    bg.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    bg.BorderSizePixel  = 0
+    bg.Position         = UDim2.new(0.05, 0, 0, yPos)
+    bg.Size             = UDim2.new(0.9, 0, 0, 22)
+    bg.ZIndex           = 10
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 4)
+
+    local accent = Instance.new("Frame")
+    accent.Parent           = bg
+    accent.BackgroundColor3 = accentColor
+    accent.BorderSizePixel  = 0
+    accent.Position         = UDim2.new(0, 0, 0.1, 0)
+    accent.Size             = UDim2.new(0, 3, 0.8, 0)
+    accent.ZIndex           = 11
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Parent           = bg
+    lbl.BackgroundTransparency = 1
+    lbl.Position         = UDim2.new(0, 10, 0, 0)
+    lbl.Size             = UDim2.new(1, -10, 1, 0)
+    lbl.Font             = Enum.Font.GothamBold
+    lbl.Text             = icon .. "  " .. text
+    lbl.TextColor3       = Color3.fromRGB(210, 210, 210)
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.TextSize         = 11
+    lbl.ZIndex           = 11
+end
+
+local function makeLabel(text, yPos, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Parent           = Frame
+    lbl.BackgroundTransparency = 1
+    lbl.Position         = UDim2.new(0.05, 0, 0, yPos)
+    lbl.Size             = UDim2.new(0.9, 0, 0, 18)
+    lbl.Font             = Enum.Font.Gotham
+    lbl.Text             = text
+    lbl.TextColor3       = color or Color3.fromRGB(170, 170, 170)
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.TextSize         = 11
+    lbl.ZIndex           = 10
+    return lbl
+end
+
+local function makeTextBox(yPos, placeholder, textColor)
+    local tb = Instance.new("TextBox")
+    tb.Parent             = Frame
+    tb.BackgroundColor3   = Color3.fromRGB(48, 48, 48)
+    tb.BorderSizePixel    = 0
+    tb.Position           = UDim2.new(0.05, 0, 0, yPos)
+    tb.Size               = UDim2.new(0.9, 0, 0, 28)
+    tb.Font               = Enum.Font.Gotham
+    tb.Text               = ""
+    tb.PlaceholderText    = placeholder
+    tb.PlaceholderColor3  = Color3.fromRGB(110, 110, 110)
+    tb.TextColor3         = textColor or Color3.fromRGB(255, 220, 80)
+    tb.TextSize           = 12
+    tb.ClearTextOnFocus   = false
+    tb.ZIndex             = 11
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 6)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = Color3.fromRGB(70, 70, 70)
+    stroke.Thickness = 1
+    stroke.Parent    = tb
+
+    return tb, stroke
+end
+
+local function makeToggleButton(yPos, accentOff)
+    local btn = Instance.new("TextButton")
+    btn.Parent           = Frame
+    btn.BackgroundColor3 = accentOff or Color3.fromRGB(180, 0, 0)
+    btn.BorderSizePixel  = 0
+    btn.Position         = UDim2.new(0.05, 0, 0, yPos)
+    btn.Size             = UDim2.new(0.9, 0, 0, 36)
+    btn.Font             = Enum.Font.GothamBold
+    btn.Text             = "DISABLED"
+    btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    btn.TextSize         = 15
+    btn.ZIndex           = 10
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    return btn
+end
+
+-- ============================================================
+-- UI CONSTRUCTION
+-- ============================================================
+makeDivider(40)
+makeCategoryHeader("📡", "REMOTE SPY", 46, Color3.fromRGB(120, 80, 220))
+
+-- FireServer section
+makeLabel("FireServer  (client → server)", 76, Color3.fromRGB(255, 160, 60))
+local FSFilterBox, FSFilterStroke = makeTextBox(96, "Filter remote name (blank = all)", Color3.fromRGB(255, 200, 80))
+local FSButton                    = makeToggleButton(130, Color3.fromRGB(160, 80, 0))
+
+makeDivider(174)
+
+-- InvokeServer section
+makeLabel("InvokeServer  (server → client)", 180, Color3.fromRGB(80, 180, 255))
+local OCEFilterBox, OCEFilterStroke = makeTextBox(200, "Filter remote name (blank = all)", Color3.fromRGB(130, 210, 255))
+local OCEButton                     = makeToggleButton(234, Color3.fromRGB(0, 80, 160))
+
+-- ============================================================
+-- DRAGGING
+-- ============================================================
+local function dragGUI(gui)
+    local dragging, dragInput, dragStart, startPos
+
+    gui.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = gui.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    gui.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            gui.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+dragGUI(Frame)
+
+-- ============================================================
+-- MINIMIZE
+-- ============================================================
+MinimizeButton.MouseButton1Click:Connect(function()
+    minimized = not minimized
+
+    if minimized then
+        MinimizeButton.Text = "+"
+        Frame.Size = UDim2.new(0, 280, 0, MINI_HEIGHT)
+    else
+        MinimizeButton.Text = "−"
+        Frame.Size = UDim2.new(0, 280, 0, FULL_HEIGHT)
+    end
+end)
+
+-- ============================================================
+-- LOG SYSTEM
+-- ============================================================
+local function addLog(direction, remoteName, args)
+    print("[" .. direction .. "] " .. remoteName)
+    for i, v in ipairs(args) do
+        print("  [" .. i .. "] =", v)
+    end
+end
+
+-- ============================================================
+-- FILTER HELPER
+-- ============================================================
+local function passesFilter(remoteName, filterText)
+    if filterText == "" then return true end
+    return string.find(remoteName:lower(), filterText:lower(), 1, true) ~= nil
+end
+
+-- ============================================================
+-- TOGGLE STATE
+-- ============================================================
+local fsEnabled  = false
+local oceEnabled = false
+
+local function setBtn(btn, enabled, onColor, offColor)
+    btn.Text             = enabled and "ENABLED" or "DISABLED"
+    btn.BackgroundColor3 = enabled and onColor or offColor
+end
+
+FSButton.MouseButton1Click:Connect(function()
+    fsEnabled = not fsEnabled
+    setBtn(FSButton, fsEnabled,
+        Color3.fromRGB(200, 110, 0),
+        Color3.fromRGB(160, 80, 0))
+    FSFilterStroke.Color = fsEnabled
+        and Color3.fromRGB(200, 150, 0)
+        or  Color3.fromRGB(70, 70, 70)
+end)
+
+OCEButton.MouseButton1Click:Connect(function()
+    oceEnabled = not oceEnabled
+    setBtn(OCEButton, oceEnabled,
+        Color3.fromRGB(0, 120, 220),
+        Color3.fromRGB(0, 80, 160))
+    OCEFilterStroke.Color = oceEnabled
+        and Color3.fromRGB(0, 150, 255)
+        or  Color3.fromRGB(70, 70, 70)
+end)
+
+-- ============================================================
+-- SERIALIZATION HELPERS
+-- ============================================================
+local function serializeTable(tbl, indent)
+    indent = indent or 1
+    local result = "{\n"
+    local prefix = string.rep("  ", indent)
+
+    for k, v in pairs(tbl) do
+        local key = type(k) == "string" and k or "[" .. tostring(k) .. "]"
+        if type(v) == "table" then
+            result = result .. prefix .. key .. " = " .. serializeTable(v, indent + 1)
+        else
+            result = result .. prefix .. key .. " = " .. tostring(v) .. "\n"
+        end
+    end
+
+    return result .. string.rep("  ", indent - 1) .. "}\n"
+end
+
+local function dumpBuffer(buf)
+    local len = buffer.len(buf)
+    if len < 1 then
+        print("  [buffer] empty")
+        return
+    end
+
+    local packetId = buffer.readu8(buf, 0)
+    local hexParts = {}
+    for i = 1, len - 1 do
+        hexParts[#hexParts + 1] = string.format("%02X", buffer.readu8(buf, i))
+    end
+
+    print(string.format("  [buffer] len=%d  packetId=%d", len, packetId))
+    print("  [payload hex] " .. table.concat(hexParts, " "))
+end
+
+local function printArgs(args, count)
+    for i = 1, count do
+        local v = args[i]
+        if type(v) == "buffer" then
+            print("  [" .. i .. "] = <buffer>")
+            dumpBuffer(v)
+        elseif type(v) == "table" then
+            print("  [" .. i .. "] = " .. serializeTable(v))
+        else
+            print("  [" .. i .. "] =", v)
+        end
+    end
+end
+
+-- ============================================================
+-- LOG CAPTURE + CLIPBOARD  (toggle with "B")
+-- ============================================================
+local logBuffer       = {}
+local captureEnabled  = false
+local oldPrint         = print
+
+-- Wrap print so every print() call (including ones above) also gets captured.
+-- Since printArgs/dumpBuffer/addLog all call the global `print`, reassigning
+-- it here is enough to capture everything they output, with no other edits.
+print = function(...)
+    local n = select('#', ...)
+    local parts = {}
+    for i = 1, n do
+        parts[i] = tostring(select(i, ...))
+    end
+    local line = table.concat(parts, "\t")
+
+    oldPrint(line)
+
+    if captureEnabled then
+        table.insert(logBuffer, line)
+    end
+end
+
+local function copyLogsToClipboard()
+    if #logBuffer == 0 then
+        oldPrint("[CAPTURE] Nothing captured yet.")
+        return
+    end
+
+    local full = table.concat(logBuffer, "\n")
+
+    if setclipboard then
+        setclipboard(full)
+        oldPrint("[CAPTURE] Copied " .. #logBuffer .. " lines to clipboard.")
+    elseif toclipboard then
+        toclipboard(full)
+        oldPrint("[CAPTURE] Copied " .. #logBuffer .. " lines to clipboard (toclipboard).")
+    else
+        oldPrint("[CAPTURE] No clipboard function available on this executor.")
+    end
+
+    table.clear(logBuffer)  -- <-- added: wipe buffer after copying
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.B then
+        captureEnabled = not captureEnabled
+
+        if captureEnabled then
+            oldPrint("[CAPTURE] Started — logging prints to buffer.")
+        else
+            oldPrint("[CAPTURE] Stopped. Copying to clipboard now...")
+            copyLogsToClipboard()
+        end
+    end
+end)
+
+-- ============================================================
+-- HOOKS
+-- ============================================================
+local oldNamecall
+oldNamecall = hookfunction(getrawmetatable(game).__namecall, function(self, ...)
+    local method = getnamecallmethod()
+
+    if method == "FireServer" and fsEnabled then
+        print("[SPY] FireServer:", self.Name)
+        printArgs({...}, select('#', ...))
+    elseif method == "InvokeServer" and oceEnabled then
+        print("[SPY] InvokeServer:", self.Name)
+        printArgs({...}, select('#', ...))
+    end
+
+    return oldNamecall(self, ...)
+end)
